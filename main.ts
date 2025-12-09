@@ -1,19 +1,25 @@
-// Deno HTTP сервер для расчёта ETA и миль по данным Samsara + city-to-city маршруты.
+// Deno HTTP сервер для расчёта ETA и миль по данным Samsara + city-to-city маршруты + Telegram webhook.
 //
 // Возможности:
 // - Свободный текст: "ETA 1234 to Dallas TX", "1234 dallas tx", "Chicago IL to Dallas TX".
 // - Структура: truckNumber + destinations[] (multi-stop) или originCity/originState + destinations[].
 // - Всегда отдаём мили и километры, ETA по каждому плечу и ссылки на маршруты в Google Maps.
-// - ТЕПЕРЬ МОЖНО ТЕСТИТЬ ЧЕРЕЗ БРАУЗЕР:
+// - ТЕСТ В БРАУЗЕРЕ:
 //   GET /eta?q=ETA 1234 to Dallas TX
-//   или
 //   GET /eta?query=Chicago IL to Dallas TX
+// - TELEGRAM WEBHOOK: POST /telegram (Telegram шлёт апдейты сюда).
 
 const SAMSARA_TOKEN = Deno.env.get("SAMSARA_API_TOKEN");
 const SAMSARA_BASE = "https://api.samsara.com";
 
+const TELEGRAM_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN");
+const TELEGRAM_API_BASE = TELEGRAM_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_TOKEN}` : null;
+
 if (!SAMSARA_TOKEN) {
   console.warn("[WARN] SAMSARA_API_TOKEN is not set. Requests to Samsara will fail.");
+}
+if (!TELEGRAM_TOKEN) {
+  console.warn("[WARN] TELEGRAM_BOT_TOKEN is not set. Telegram replies will be disabled.");
 }
 
 // ===== Типы =====
@@ -343,7 +349,7 @@ function parseFreeformQuery(q: string): ParsedQuery | null {
   return null;
 }
 
-// ===== Основная логика =====
+// ===== Бизнес-логика ETA (общая для API и Telegram) =====
 
 async function processEta(payload: EtaRequest): Promise<Response> {
   if (!SAMSARA_TOKEN) {
@@ -561,6 +567,131 @@ async function processEta(payload: EtaRequest): Promise<Response> {
   }
 }
 
+// ===== Telegram =====
+
+async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
+  if (!TELEGRAM_API_BASE) {
+    console.warn("[WARN] TELEGRAM_API_BASE not set, cannot send Telegram messages");
+    return;
+  }
+  await fetch(`${TELEGRAM_API_BASE}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: false,
+    }),
+  }).catch((e) => console.error("Failed to send Telegram message", e));
+}
+
+async function handleTelegram(req: Request): Promise<Response> {
+  if (req.method !== "POST") {
+    return new Response("ok");
+  }
+
+  let update: any;
+  try {
+    update = await req.json();
+  } catch {
+    return new Response("ok");
+  }
+
+  const message = update.message ?? update.edited_message;
+  if (!message || typeof message.text !== "string") {
+    return new Response("ok");
+  }
+
+  const chatId: number = message.chat.id;
+  const text: string = message.text.trim();
+
+  if (!text) {
+    return new Response("ok");
+  }
+
+  if (text === "/start") {
+    await sendTelegramMessage(
+      chatId,
+      "Отправь запрос в формате:\n\n" +
+        "<code>ETA 1234 to Dallas TX</code>\n" +
+        "или\n" +
+        "<code>Chicago IL to Dallas TX</code>",
+    );
+    return new Response("ok");
+  }
+
+  // Прокидываем текст как query в наш ETA-движок
+  const etaResp = await processEta({ query: text });
+  const clone = etaResp.clone();
+
+  let body: any = null;
+  try {
+    body = await clone.json();
+  } catch {
+    body = null;
+  }
+
+  if (!etaResp.ok || !body || body.error) {
+    await sendTelegramMessage(
+      chatId,
+      `Ошибка расчёта ETA: ${body?.error ?? `HTTP ${etaResp.status}`}`,
+    );
+    return new Response("ok");
+  }
+
+  const eta = body as ApiResponse;
+
+  // Формируем понятный текст
+  const lines: string[] = [];
+
+  if (eta.truckNumber) {
+    lines.push(`🚛 Truck <b>${eta.truckNumber}</b>`);
+  } else if (eta.mode === "city") {
+    lines.push("📍 Маршрут city-to-city");
+  }
+
+  if (eta.origin?.label) {
+    lines.push(`Откуда: <b>${eta.origin.label}</b>`);
+  }
+
+  if (Array.isArray(eta.legs) && eta.legs.length > 0) {
+    const first = eta.legs[0];
+    lines.push(
+      `Куда: <b>${first.destination.label}</b>`,
+    );
+    lines.push(
+      `Дистанция: <b>${first.distanceMiles.toFixed(1)} mi</b> (${first.distanceKm.toFixed(1)} km)`,
+    );
+    lines.push(
+      `ETA по плечу: <b>${first.durationHuman}</b>`,
+    );
+    lines.push(`Прибытие: <code>${first.arrivalIso}</code>`);
+    lines.push(`Маршрут: ${first.mapsDirectionsUrl}`);
+  }
+
+  if (eta.summary) {
+    lines.push("");
+    lines.push(
+      `Всего по маршруту: <b>${eta.summary.totalDistanceMiles.toFixed(1)} mi</b> (${eta.summary.totalDistanceKm.toFixed(1)} km), <b>${eta.summary.totalDurationHuman}</b>`,
+    );
+    lines.push(`Полный маршрут: ${eta.summary.mapsDirectionsUrl}`);
+  }
+
+  if (eta.vehicleLocation?.mapsUrl) {
+    lines.push("");
+    lines.push(`Текущее положение трака: ${eta.vehicleLocation.mapsUrl}`);
+  }
+
+  if (lines.length === 0) {
+    lines.push("Нет данных по ETA.");
+  }
+
+  await sendTelegramMessage(chatId, lines.join("\n"));
+
+  return new Response("ok");
+}
+
 // ===== HTTP сервер =====
 
 Deno.serve((req) => {
@@ -594,6 +725,10 @@ Deno.serve((req) => {
       status: 405,
       headers: { "Content-Type": "application/json" },
     });
+  }
+
+  if (url.pathname === "/telegram") {
+    return handleTelegram(req);
   }
 
   if (url.pathname === "/health") {
