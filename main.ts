@@ -4,6 +4,10 @@
 // - Свободный текст: "ETA 1234 to Dallas TX", "1234 dallas tx", "Chicago IL to Dallas TX".
 // - Структура: truckNumber + destinations[] (multi-stop) или originCity/originState + destinations[].
 // - Всегда отдаём мили и километры, ETA по каждому плечу и ссылки на маршруты в Google Maps.
+// - ТЕПЕРЬ МОЖНО ТЕСТИТЬ ЧЕРЕЗ БРАУЗЕР:
+//   GET /eta?q=ETA 1234 to Dallas TX
+//   или
+//   GET /eta?query=Chicago IL to Dallas TX
 
 const SAMSARA_TOKEN = Deno.env.get("SAMSARA_API_TOKEN");
 const SAMSARA_BASE = "https://api.samsara.com";
@@ -283,10 +287,10 @@ function buildMultiStopDirectionsUrl(origin: Point, stops: Point[]): string {
   if (stops.length === 0) {
     return buildDirectionsUrl(origin, origin);
   }
-  const firstDest = stops[stops.length - 1];
+  const finalDest = stops[stops.length - 1];
   const waypoints = stops.slice(0, -1);
   const originParam = encodeURIComponent(`${origin.lat},${origin.lng}`);
-  const destParam = encodeURIComponent(`${firstDest.lat},${firstDest.lng}`);
+  const destParam = encodeURIComponent(`${finalDest.lat},${finalDest.lng}`);
   let url =
     `https://www.google.com/maps/dir/?api=1&origin=${originParam}&destination=${destParam}&travelmode=driving`;
   if (waypoints.length > 0) {
@@ -339,26 +343,9 @@ function parseFreeformQuery(q: string): ParsedQuery | null {
   return null;
 }
 
-// ===== Основной handler =====
+// ===== Основная логика =====
 
-async function handleEta(req: Request): Promise<Response> {
-  if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Use POST" }), {
-      status: 405,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  let payload: EtaRequest;
-  try {
-    payload = await req.json();
-  } catch {
-    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
+async function processEta(payload: EtaRequest): Promise<Response> {
   if (!SAMSARA_TOKEN) {
     return new Response(JSON.stringify({ error: "SAMSARA_API_TOKEN is not configured" }), {
       status: 500,
@@ -440,7 +427,9 @@ async function handleEta(req: Request): Promise<Response> {
     } else {
       // city-based origin
       if (!originCity || !originState) {
-        return new Response(JSON.stringify({ error: "originCity and originState are required for city-based routing" }), {
+        return new Response(JSON.stringify({
+          error: "originCity and originState are required for city-based routing (when truckNumber is not provided)",
+        }), {
           status: 400,
           headers: { "Content-Type": "application/json" },
         });
@@ -576,13 +565,42 @@ async function handleEta(req: Request): Promise<Response> {
 
 Deno.serve((req) => {
   const url = new URL(req.url);
+
   if (url.pathname === "/eta") {
-    return handleEta(req);
+    // GET для простого теста из браузера
+    if (req.method === "GET") {
+      const q = url.searchParams.get("q") ?? url.searchParams.get("query") ?? "";
+      const payload: EtaRequest = { query: q };
+      return processEta(payload);
+    }
+
+    // POST для боевого использования
+    if (req.method === "POST") {
+      return (async () => {
+        let payload: EtaRequest;
+        try {
+          payload = await req.json();
+        } catch {
+          return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return processEta(payload);
+      })();
+    }
+
+    return new Response(JSON.stringify({ error: "Use GET or POST" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json" },
+    });
   }
+
   if (url.pathname === "/health") {
     return new Response(JSON.stringify({ ok: true }), {
       headers: { "Content-Type": "application/json" },
     });
   }
+
   return new Response("Not Found", { status: 404 });
 });
