@@ -1,13 +1,13 @@
-// Deno HTTP сервер для расчёта ETA и миль по данным Samsara + city-to-city маршруты + Telegram webhook.
+// Deno HTTP server for ETA + mileage based on Samsara GPS + city-to-city routes + Telegram webhook.
 //
-// Возможности:
-// - Свободный текст: "ETA 1234 to Dallas TX", "1234 dallas tx", "Chicago IL to Dallas TX".
-// - Структура: truckNumber + destinations[] (multi-stop) или originCity/originState + destinations[].
-// - Всегда отдаём мили и километры, ETA по каждому плечу и ссылки на маршруты в Google Maps.
-// - ТЕСТ В БРАУЗЕРЕ:
-//   GET /eta?q=ETA 1234 to Dallas TX
+// Features:
+// - Free-text queries: "ETA 5051 to Dallas TX", "5051 Dallas TX", "Chicago IL to Dallas TX".
+// - Structured JSON: truckNumber + destinations[] (multi-stop) or originCity/originState + destinations[].
+// - Returns miles + kilometers, ETA for each leg, and Google Maps route links.
+// - Browser test:
+//   GET /eta?q=ETA 5051 to Dallas TX
 //   GET /eta?query=Chicago IL to Dallas TX
-// - TELEGRAM WEBHOOK: POST /telegram (Telegram шлёт апдейты сюда).
+// - Telegram webhook: POST /telegram (Telegram sends updates here).
 
 const SAMSARA_TOKEN = Deno.env.get("SAMSARA_API_TOKEN");
 const SAMSARA_BASE = "https://api.samsara.com";
@@ -22,7 +22,7 @@ if (!TELEGRAM_TOKEN) {
   console.warn("[WARN] TELEGRAM_BOT_TOKEN is not set. Telegram replies will be disabled.");
 }
 
-// ===== Типы =====
+// ===== Types =====
 
 type StopInput = {
   city?: string;
@@ -33,18 +33,18 @@ type StopInput = {
 type EtaRequest = {
   query?: string;
 
-  // Truck-based
+  // truck-based
   truckNumber?: string;
 
-  // Single destination (backward compatibility)
+  // single destination (backward compatibility)
   city?: string;
   state?: string;
 
-  // City-based origin
+  // city-based origin
   originCity?: string;
   originState?: string;
 
-  // Multiple stops
+  // multiple stops
   destinations?: StopInput[];
 };
 
@@ -115,16 +115,16 @@ type ApiResponse = {
     formattedAddress: string | null;
     mapsUrl: string;
   };
-  // origin summary (truck location или origin city)
+  // origin summary
   origin: {
     label: string;
     lat: number;
     lng: number;
     mapsUrl: string;
   };
-  // плечи
+  // legs
   legs: LegResponse[];
-  // суммарные метрики по маршруту
+  // route summary
   summary: {
     totalDistanceKm: number;
     totalDistanceMiles: number;
@@ -133,7 +133,7 @@ type ApiResponse = {
     finalArrivalIso: string;
     mapsDirectionsUrl: string;
   };
-  // для обратной совместимости при единственном стопе
+  // backward compatibility for single-stop case
   eta?: {
     distanceKm: number;
     distanceMiles: number;
@@ -149,13 +149,13 @@ type ApiResponse = {
   };
 };
 
-// ===== Утилиты =====
+// ===== Utils =====
 
 async function fetchJson(url: string, init: RequestInit = {}): Promise<any> {
   const headers: HeadersInit = {
     ...init.headers,
-    "Authorization": `Bearer ${SAMSARA_TOKEN}`,
-    "Accept": "application/json",
+    Authorization: `Bearer ${SAMSARA_TOKEN}`,
+    Accept: "application/json",
   };
 
   const response = await fetch(url, { ...init, headers });
@@ -166,7 +166,7 @@ async function fetchJson(url: string, init: RequestInit = {}): Promise<any> {
   return await response.json();
 }
 
-// Поиск трака по name == truckNumber
+// find truck by name == truckNumber in Samsara
 async function findVehicleByTruckNumber(truckNumber: string): Promise<{ id: string; name: string } | null> {
   let after: string | undefined = undefined;
 
@@ -193,7 +193,7 @@ async function findVehicleByTruckNumber(truckNumber: string): Promise<{ id: stri
   return null;
 }
 
-// Берём GPS-данные по vehicleId
+// get GPS stats by vehicleId
 async function getVehicleGpsById(vehicleId: string): Promise<GpsStat | null> {
   const params = new URLSearchParams();
   params.set("types", "gps");
@@ -204,7 +204,7 @@ async function getVehicleGpsById(vehicleId: string): Promise<GpsStat | null> {
   return v?.gps ?? null;
 }
 
-// Геокодинг (город/штат или полный адрес)
+// geocode city/state or full address
 async function geocode(query: string): Promise<Point | null> {
   const params = new URLSearchParams();
   params.set("q", query);
@@ -214,7 +214,7 @@ async function geocode(query: string): Promise<Point | null> {
   const url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
   const response = await fetch(url, {
     headers: {
-      "Accept": "application/json",
+      Accept: "application/json",
       "User-Agent": "samsara-eta-bot/1.0 (deno-deploy)",
     },
   });
@@ -247,7 +247,7 @@ async function geocodeStop(stop: StopInput): Promise<{ point: Point; label: stri
   throw new Error("Stop must have either address or city+state");
 }
 
-// Маршрут и ETA через OSRM
+// routing and ETA via OSRM
 async function routeEta(origin: Point, dest: Point): Promise<{ distanceKm: number; durationSeconds: number }> {
   const url =
     `https://router.project-osrm.org/route/v1/driving/${origin.lng},${origin.lat};${dest.lng},${dest.lat}?overview=false&annotations=duration`;
@@ -276,7 +276,7 @@ function formatDuration(sec: number): string {
 }
 
 function kmToMiles(km: number): number {
-  return Math.round((km * 0.621371) * 10) / 10; // 1 знак после запятой
+  return Math.round(km * 0.621371 * 10) / 10; // 1 decimal
 }
 
 function buildPointMapsUrl(point: Point): string {
@@ -306,7 +306,7 @@ function buildMultiStopDirectionsUrl(origin: Point, stops: Point[]): string {
   return url;
 }
 
-// Парсинг свободного текста
+// parse free-text requests
 function parseFreeformQuery(q: string): ParsedQuery | null {
   const tokens = q.trim().split(/\s+/).filter((t) => t.length > 0);
   if (tokens.length < 2) return null;
@@ -314,7 +314,7 @@ function parseFreeformQuery(q: string): ParsedQuery | null {
   const lower = tokens.map((t) => t.toLowerCase());
   const toIdx = lower.findIndex((t) => t === "to");
 
-  // truckNumber = первый токен с цифрой
+  // truckNumber = first token with a digit
   const truckIdx = tokens.findIndex((t) => /\d/.test(t));
 
   if (truckIdx >= 0) {
@@ -349,7 +349,7 @@ function parseFreeformQuery(q: string): ParsedQuery | null {
   return null;
 }
 
-// ===== Бизнес-логика ETA (общая для API и Telegram) =====
+// ===== Core ETA logic (shared by API + Telegram) =====
 
 async function processEta(payload: EtaRequest): Promise<Response> {
   if (!SAMSARA_TOKEN) {
@@ -361,7 +361,7 @@ async function processEta(payload: EtaRequest): Promise<Response> {
 
   let { truckNumber, city, state, originCity, originState } = payload;
 
-  // Свободный текст имеет приоритет, если задан
+  // free-text has priority
   if (payload.query && payload.query.trim().length > 0) {
     const parsed = parseFreeformQuery(payload.query);
     if (parsed) {
@@ -378,7 +378,7 @@ async function processEta(payload: EtaRequest): Promise<Response> {
     }
   }
 
-  // Собираем массив стопов
+  // collect stops
   const stops: StopInput[] = [];
   if (Array.isArray(payload.destinations) && payload.destinations.length > 0) {
     stops.push(...payload.destinations);
@@ -433,12 +433,15 @@ async function processEta(payload: EtaRequest): Promise<Response> {
     } else {
       // city-based origin
       if (!originCity || !originState) {
-        return new Response(JSON.stringify({
-          error: "originCity and originState are required for city-based routing (when truckNumber is not provided)",
-        }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({
+            error: "originCity and originState are required for city-based routing when truckNumber is not provided",
+          }),
+          {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
       }
       mode = "city";
       const origin = await geocodeCityState(originCity, originState);
@@ -452,14 +455,14 @@ async function processEta(payload: EtaRequest): Promise<Response> {
       originLabel = `${originCity}, ${originState}`;
     }
 
-    // Геокодим все стопы
+    // geocode stops
     const stopGeos = [];
     for (const s of stops) {
       const geo = await geocodeStop(s);
       stopGeos.push(geo);
     }
 
-    // Считаем плечи
+    // build legs
     const legs: LegResponse[] = [];
     let currentPoint: Point = originPoint;
     let currentLabel: string = originLabel;
@@ -536,7 +539,7 @@ async function processEta(payload: EtaRequest): Promise<Response> {
       },
     };
 
-    // Обратная совместимость для одного стопа
+    // backward compatibility for single destination
     if (legs.length === 1) {
       const first = legs[0];
       response.eta = {
@@ -567,7 +570,7 @@ async function processEta(payload: EtaRequest): Promise<Response> {
   }
 }
 
-// ===== Telegram =====
+// ===== Telegram helpers =====
 
 async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
   if (!TELEGRAM_API_BASE) {
@@ -586,6 +589,7 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<void> 
   }).catch((e) => console.error("Failed to send Telegram message", e));
 }
 
+// Telegram webhook handler
 async function handleTelegram(req: Request): Promise<Response> {
   if (req.method !== "POST") {
     return new Response("ok");
@@ -613,15 +617,20 @@ async function handleTelegram(req: Request): Promise<Response> {
   if (text === "/start") {
     await sendTelegramMessage(
       chatId,
-      "Отправь запрос в формате:\n\n" +
-        "<code>ETA 1234 to Dallas TX</code>\n" +
-        "или\n" +
+      [
+        "Send an ETA request, for example:",
+        "",
+        "<code>ETA 5051 to Dallas TX</code>",
+        "<code>5051 Dallas TX</code>",
         "<code>Chicago IL to Dallas TX</code>",
+        "",
+        "You can also send city-to-city only: <code>Chicago IL to Dallas TX</code>",
+      ].join("\n"),
     );
     return new Response("ok");
   }
 
-  // Прокидываем текст как query в наш ETA-движок
+  // feed user text into ETA engine
   const etaResp = await processEta({ query: text });
   const clone = etaResp.clone();
 
@@ -635,56 +644,54 @@ async function handleTelegram(req: Request): Promise<Response> {
   if (!etaResp.ok || !body || body.error) {
     await sendTelegramMessage(
       chatId,
-      `Ошибка расчёта ETA: ${body?.error ?? `HTTP ${etaResp.status}`}`,
+      `ETA calculation error: ${body?.error ?? `HTTP ${etaResp.status}`}`,
     );
     return new Response("ok");
   }
 
   const eta = body as ApiResponse;
 
-  // Формируем понятный текст
+  // build trucking-style text
   const lines: string[] = [];
 
   if (eta.truckNumber) {
     lines.push(`🚛 Truck <b>${eta.truckNumber}</b>`);
   } else if (eta.mode === "city") {
-    lines.push("📍 Маршрут city-to-city");
+    lines.push("📍 City-to-city route");
   }
 
   if (eta.origin?.label) {
-    lines.push(`Откуда: <b>${eta.origin.label}</b>`);
+    lines.push(`Origin: <b>${eta.origin.label}</b>`);
   }
 
   if (Array.isArray(eta.legs) && eta.legs.length > 0) {
     const first = eta.legs[0];
+
+    lines.push(`Destination: <b>${first.destination.label}</b>`);
     lines.push(
-      `Куда: <b>${first.destination.label}</b>`,
+      `Distance: <b>${first.distanceMiles.toFixed(1)} mi</b> (${first.distanceKm.toFixed(1)} km)`,
     );
-    lines.push(
-      `Дистанция: <b>${first.distanceMiles.toFixed(1)} mi</b> (${first.distanceKm.toFixed(1)} km)`,
-    );
-    lines.push(
-      `ETA по плечу: <b>${first.durationHuman}</b>`,
-    );
-    lines.push(`Прибытие: <code>${first.arrivalIso}</code>`);
-    lines.push(`Маршрут: ${first.mapsDirectionsUrl}`);
+    lines.push(`ETA drive time: <b>${first.durationHuman}</b>`);
+    lines.push(`ETA arrival time: <code>${first.arrivalIso}</code>`);
+    lines.push(`Route link: ${first.mapsDirectionsUrl}`);
   }
 
   if (eta.summary) {
     lines.push("");
     lines.push(
-      `Всего по маршруту: <b>${eta.summary.totalDistanceMiles.toFixed(1)} mi</b> (${eta.summary.totalDistanceKm.toFixed(1)} km), <b>${eta.summary.totalDurationHuman}</b>`,
+      `Total route distance: <b>${eta.summary.totalDistanceMiles.toFixed(1)} mi</b> (${eta.summary.totalDistanceKm.toFixed(1)} km)`,
     );
-    lines.push(`Полный маршрут: ${eta.summary.mapsDirectionsUrl}`);
+    lines.push(`Total drive time: <b>${eta.summary.totalDurationHuman}</b>`);
+    lines.push(`Full route link: ${eta.summary.mapsDirectionsUrl}`);
   }
 
   if (eta.vehicleLocation?.mapsUrl) {
     lines.push("");
-    lines.push(`Текущее положение трака: ${eta.vehicleLocation.mapsUrl}`);
+    lines.push(`Truck current GPS position: ${eta.vehicleLocation.mapsUrl}`);
   }
 
   if (lines.length === 0) {
-    lines.push("Нет данных по ETA.");
+    lines.push("No ETA data available for this request.");
   }
 
   await sendTelegramMessage(chatId, lines.join("\n"));
@@ -692,20 +699,20 @@ async function handleTelegram(req: Request): Promise<Response> {
   return new Response("ok");
 }
 
-// ===== HTTP сервер =====
+// ===== HTTP server =====
 
 Deno.serve((req) => {
   const url = new URL(req.url);
 
   if (url.pathname === "/eta") {
-    // GET для простого теста из браузера
+    // simple browser test
     if (req.method === "GET") {
       const q = url.searchParams.get("q") ?? url.searchParams.get("query") ?? "";
       const payload: EtaRequest = { query: q };
       return processEta(payload);
     }
 
-    // POST для боевого использования
+    // POST for production usage
     if (req.method === "POST") {
       return (async () => {
         let payload: EtaRequest;
