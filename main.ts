@@ -306,6 +306,19 @@ function buildMultiStopDirectionsUrl(origin: Point, stops: Point[]): string {
   return url;
 }
 
+// format arrival time in Chicago time (CDT/CST)
+function formatChicagoTime(iso: string): string {
+  const d = new Date(iso);
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const t = formatter.format(d);
+  return `${t} CDT`;
+}
+
 // parse free-text requests
 function parseFreeformQuery(q: string): ParsedQuery | null {
   const tokens = q.trim().split(/\s+/).filter((t) => t.length > 0);
@@ -651,7 +664,6 @@ async function handleTelegram(req: Request): Promise<Response> {
 
   const eta = body as ApiResponse;
 
-  // build trucking-style text
   const lines: string[] = [];
 
   if (eta.truckNumber) {
@@ -666,22 +678,26 @@ async function handleTelegram(req: Request): Promise<Response> {
 
   if (Array.isArray(eta.legs) && eta.legs.length > 0) {
     const first = eta.legs[0];
+    const firstArrivalLocal = formatChicagoTime(first.arrivalIso);
 
     lines.push(`Destination: <b>${first.destination.label}</b>`);
-    lines.push(
-      `Distance: <b>${first.distanceMiles.toFixed(1)} mi</b> (${first.distanceKm.toFixed(1)} km)`,
-    );
+    lines.push(`Distance: <b>${first.distanceMiles.toFixed(1)} mi</b>`);
     lines.push(`ETA drive time: <b>${first.durationHuman}</b>`);
-    lines.push(`ETA arrival time: <code>${first.arrivalIso}</code>`);
+    lines.push(`ETA arrival time: <b>${firstArrivalLocal}</b>`);
+
+    lines.push("");
     lines.push(`Route link: ${first.mapsDirectionsUrl}`);
   }
 
   if (eta.summary) {
+    const finalArrivalLocal = formatChicagoTime(eta.summary.finalArrivalIso);
+
     lines.push("");
-    lines.push(
-      `Total route distance: <b>${eta.summary.totalDistanceMiles.toFixed(1)} mi</b> (${eta.summary.totalDistanceKm.toFixed(1)} km)`,
-    );
+    lines.push(`Total route distance: <b>${eta.summary.totalDistanceMiles.toFixed(1)} mi</b>`);
     lines.push(`Total drive time: <b>${eta.summary.totalDurationHuman}</b>`);
+    lines.push(`Final ETA arrival time: <b>${finalArrivalLocal}</b>`);
+
+    lines.push("");
     lines.push(`Full route link: ${eta.summary.mapsDirectionsUrl}`);
   }
 
