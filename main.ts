@@ -673,7 +673,7 @@ async function handleTelegram(req: Request): Promise<Response> {
   }
 
   if (eta.origin?.label) {
-    lines.push(`Origin: <b>${eta.origin.label}</b>`);
+    lines.push(`Current location: <b>${eta.origin.label}</b>`);
   }
 
   if (Array.isArray(eta.legs) && eta.legs.length > 0) {
